@@ -4,8 +4,6 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import db from './db.js';
-import fs from 'fs';
-import path from 'path';
 
 const app = express();
 const server = http.createServer(app);
@@ -16,35 +14,8 @@ const io = new Server(server, {
 const JWT_SECRET = 'teledrag-super-secret-key';
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // для приёма аватаров
 app.use(express.static('.')); // раздаём index.html
-
-// Синхронизация админов из admins.txt
-function syncAdminsFromFile() {
-  try {
-    const adminsPath = path.join(process.cwd(), 'admins.txt');
-    if (!fs.existsSync(adminsPath)) {
-      console.log('admins.txt не найден, пропускаем синхронизацию админов');
-      return;
-    }
-    const data = fs.readFileSync(adminsPath, 'utf-8');
-    const adminUsernames = data.split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0);
-
-    // Сбрасываем всем роль user, затем назначаем админов
-    db.prepare("UPDATE users SET role = 'user'").run();
-    const stmt = db.prepare("UPDATE users SET role = 'admin' WHERE username = ?");
-    for (const name of adminUsernames) {
-      stmt.run(name);
-    }
-    console.log(`Админы синхронизированы: ${adminUsernames.join(', ')}`);
-  } catch (e) {
-    console.error('Ошибка синхронизации админов:', e.message);
-  }
-}
-
-syncAdminsFromFile();
 
 // Middleware для проверки администратора
 function adminOnly(req, res, next) {
@@ -64,16 +35,19 @@ function adminOnly(req, res, next) {
   }
 }
 
-// Регистрация
+// Регистрация – Drag получает роль admin и верификацию
 app.post('/api/register', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
 
   try {
-    const stmt = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)');
-    const result = stmt.run(username, password);
+    const role = (username === 'Drag') ? 'admin' : 'user';
+    const verified = (username === 'Drag') ? 1 : 0;
+
+    const stmt = db.prepare('INSERT INTO users (username, password, role, verified) VALUES (?, ?, ?, ?)');
+    const result = stmt.run(username, password, role, verified);
     const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role, verified FROM users WHERE id = ?').get(result.lastInsertRowid);
+    const user = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users WHERE id = ?').get(result.lastInsertRowid);
     res.json({ token, user });
   } catch (e) {
     res.status(400).json({ error: 'Пользователь уже существует' });
@@ -87,7 +61,7 @@ app.post('/api/login', (req, res) => {
   if (!user) return res.status(401).json({ error: 'Неверные данные' });
 
   const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-  res.json({ token, user: { id: user.id, username: user.username, stars: user.stars, role: user.role, verified: user.verified } });
+  res.json({ token, user: { id: user.id, username: user.username, stars: user.stars, role: user.role, verified: user.verified, avatar: user.avatar || '', created_at: user.created_at } });
 });
 
 // Получить свои данные
@@ -96,7 +70,7 @@ app.get('/api/me', (req, res) => {
   if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
   try {
     const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role, verified FROM users WHERE id = ?').get(decoded.id);
+    const user = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users WHERE id = ?').get(decoded.id);
     if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
     res.json(user);
   } catch (e) {
@@ -104,7 +78,7 @@ app.get('/api/me', (req, res) => {
   }
 });
 
-// Список пользователей (с поиском и verified)
+// Список пользователей (с поиском, avatar и verified)
 app.get('/api/users', (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
@@ -112,7 +86,7 @@ app.get('/api/users', (req, res) => {
     const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
     const search = req.query.search || '';
     const users = db.prepare(`
-      SELECT id, username, stars, verified FROM users
+      SELECT id, username, stars, verified, avatar FROM users
       WHERE id != ? AND username LIKE ?
       ORDER BY username ASC
     `).all(decoded.id, `%${search}%`);
@@ -140,15 +114,37 @@ app.get('/api/messages/:userId', (req, res) => {
   }
 });
 
-// === Админ-маршруты ===
+// Загрузка аватара (только для себя)
+app.post('/api/upload-avatar', (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
+  try {
+    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+    const { avatar } = req.body; // base64
+    if (!avatar) return res.status(400).json({ error: 'Нет изображения' });
+    db.prepare('UPDATE users SET avatar = ? WHERE id = ?').run(avatar, decoded.id);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(401).json({ error: 'Ошибка' });
+  }
+});
 
-// Получить всех пользователей (для админки)
+// Получить аватар пользователя
+app.get('/api/avatar/:userId', (req, res) => {
+  const user = db.prepare('SELECT avatar FROM users WHERE id = ?').get(req.params.userId);
+  if (user && user.avatar) {
+    res.json({ avatar: user.avatar });
+  } else {
+    res.json({ avatar: null });
+  }
+});
+
+// ===== Админ-маршруты =====
 app.get('/api/admin/users', adminOnly, (req, res) => {
-  const users = db.prepare('SELECT id, username, stars, role, verified FROM users ORDER BY username ASC').all();
+  const users = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users ORDER BY username ASC').all();
   res.json(users);
 });
 
-// Выдать звёзды по username
 app.post('/api/admin/give-stars', adminOnly, (req, res) => {
   const { username, stars } = req.body;
   if (!username || stars === undefined) return res.status(400).json({ error: 'Укажите username и количество звёзд' });
@@ -158,7 +154,6 @@ app.post('/api/admin/give-stars', adminOnly, (req, res) => {
   res.json({ success: true, message: `${username} получил ${stars} звёзд` });
 });
 
-// Установить звёзды конкретному пользователю (по ID)
 app.post('/api/admin/set-stars', adminOnly, (req, res) => {
   const { userId, stars } = req.body;
   if (!userId || stars === undefined) return res.status(400).json({ error: 'Укажите userId и количество звёзд' });
@@ -166,7 +161,6 @@ app.post('/api/admin/set-stars', adminOnly, (req, res) => {
   res.json({ success: true });
 });
 
-// Назначить администратора по username
 app.post('/api/admin/make-admin', adminOnly, (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'Укажите username' });
@@ -176,7 +170,6 @@ app.post('/api/admin/make-admin', adminOnly, (req, res) => {
   res.json({ success: true, message: `${username} теперь администратор` });
 });
 
-// Переключить верификацию (галочку) по username
 app.post('/api/admin/toggle-verify', adminOnly, (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'Укажите username' });
@@ -187,7 +180,6 @@ app.post('/api/admin/toggle-verify', adminOnly, (req, res) => {
   res.json({ success: true, verified: newVerified, message: `${username} ${newVerified ? 'получил' : 'лишился'} галочки` });
 });
 
-// Удалить пользователя
 app.post('/api/admin/delete-user', adminOnly, (req, res) => {
   const { userId } = req.body;
   db.prepare('DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?').run(userId, userId);
@@ -196,7 +188,7 @@ app.post('/api/admin/delete-user', adminOnly, (req, res) => {
   res.json({ success: true });
 });
 
-// === WebSocket ===
+// ===== WebSocket =====
 io.on('connection', (socket) => {
   let currentUserId = null;
   socket.on('authenticate', (token) => {
