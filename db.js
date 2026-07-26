@@ -9,7 +9,9 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
     password TEXT NOT NULL,
-    stars INTEGER DEFAULT 100
+    stars INTEGER DEFAULT 100,
+    role TEXT DEFAULT 'user',
+    verified INTEGER DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -32,5 +34,12 @@ db.exec(`
     FOREIGN KEY (user_id) REFERENCES users(id)
   );
 `);
+
+// Добавляем колонку verified, если её ещё нет (для старых баз)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0`);
+} catch (e) {
+  // Колонка уже существует – игнорируем ошибку
+}
 
 export default db;
