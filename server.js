@@ -17,8 +17,8 @@ const JWT_SECRET = 'teledrag-super-secret-key';
 
 app.use(cors());
 app.use(express.json());
+app.use(express.static('.')); // <-- ВОТ ЭТА СТРОКА ДОБАВЛЕНА
 
-// Товары в магазине
 const shopItems = [
   { id: 1, name: 'Стикер-пак "Драконы"', price: 50 },
   { id: 2, name: 'Премиум статус на 30 дней', price: 200 },
@@ -41,7 +41,6 @@ function syncAdminsFromFile() {
       .map(line => line.trim())
       .filter(line => line.length > 0);
 
-    // Сбрасываем всем роль user, потом назначаем админов из файла
     db.prepare("UPDATE users SET role = 'user'").run();
     const stmt = db.prepare("UPDATE users SET role = 'admin' WHERE username = ?");
     for (const name of adminUsernames) {
