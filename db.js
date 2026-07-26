@@ -11,7 +11,9 @@ db.exec(`
     password TEXT NOT NULL,
     stars INTEGER DEFAULT 100,
     role TEXT DEFAULT 'user',
-    verified INTEGER DEFAULT 0
+    verified INTEGER DEFAULT 0,
+    avatar TEXT DEFAULT '',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS messages (
@@ -35,11 +37,9 @@ db.exec(`
   );
 `);
 
-// Добавляем колонку verified, если её ещё нет (для старых баз)
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0`);
-} catch (e) {
-  // Колонка уже существует – игнорируем ошибку
-}
+// Добавляем колонки, если таблица уже существует (для совместимости)
+try { db.exec(`ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT ''`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0`); } catch (e) {}
+try { db.exec(`ALTER TABLE users ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP`); } catch (e) {}
 
 export default db;
