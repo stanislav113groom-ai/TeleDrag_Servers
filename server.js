@@ -17,16 +17,7 @@ const JWT_SECRET = 'teledrag-super-secret-key';
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static('.')); // <-- ВОТ ЭТА СТРОКА ДОБАВЛЕНА
-
-const shopItems = [
-  { id: 1, name: 'Стикер-пак "Драконы"', price: 50 },
-  { id: 2, name: 'Премиум статус на 30 дней', price: 200 },
-  { id: 3, name: 'Анимированный аватар', price: 150 },
-  { id: 4, name: 'Дополнительные реакции', price: 75 },
-  { id: 5, name: 'Статуя Газана (блогер)', price: 25000 },
-  { id: 6, name: 'Плюшевая золотая лягушка', price: 100000 }
-];
+app.use(express.static('.')); // раздаём index.html
 
 // Синхронизация админов из admins.txt
 function syncAdminsFromFile() {
@@ -41,6 +32,7 @@ function syncAdminsFromFile() {
       .map(line => line.trim())
       .filter(line => line.length > 0);
 
+    // Сбрасываем всем роль user, затем назначаем админов
     db.prepare("UPDATE users SET role = 'user'").run();
     const stmt = db.prepare("UPDATE users SET role = 'admin' WHERE username = ?");
     for (const name of adminUsernames) {
@@ -81,7 +73,7 @@ app.post('/api/register', (req, res) => {
     const stmt = db.prepare('INSERT INTO users (username, password) VALUES (?, ?)');
     const result = stmt.run(username, password);
     const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role FROM users WHERE id = ?').get(result.lastInsertRowid);
+    const user = db.prepare('SELECT id, username, stars, role, verified FROM users WHERE id = ?').get(result.lastInsertRowid);
     res.json({ token, user });
   } catch (e) {
     res.status(400).json({ error: 'Пользователь уже существует' });
@@ -95,7 +87,7 @@ app.post('/api/login', (req, res) => {
   if (!user) return res.status(401).json({ error: 'Неверные данные' });
 
   const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-  res.json({ token, user: { id: user.id, username: user.username, stars: user.stars, role: user.role } });
+  res.json({ token, user: { id: user.id, username: user.username, stars: user.stars, role: user.role, verified: user.verified } });
 });
 
 // Получить свои данные
@@ -104,7 +96,7 @@ app.get('/api/me', (req, res) => {
   if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
   try {
     const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role FROM users WHERE id = ?').get(decoded.id);
+    const user = db.prepare('SELECT id, username, stars, role, verified FROM users WHERE id = ?').get(decoded.id);
     if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
     res.json(user);
   } catch (e) {
@@ -112,7 +104,7 @@ app.get('/api/me', (req, res) => {
   }
 });
 
-// Список пользователей (с поиском)
+// Список пользователей (с поиском и verified)
 app.get('/api/users', (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
@@ -120,7 +112,7 @@ app.get('/api/users', (req, res) => {
     const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
     const search = req.query.search || '';
     const users = db.prepare(`
-      SELECT id, username, stars FROM users
+      SELECT id, username, stars, verified FROM users
       WHERE id != ? AND username LIKE ?
       ORDER BY username ASC
     `).all(decoded.id, `%${search}%`);
@@ -148,50 +140,15 @@ app.get('/api/messages/:userId', (req, res) => {
   }
 });
 
-// Магазин: список товаров
-app.get('/api/shop/items', (req, res) => {
-  res.json(shopItems);
-});
-
-// Покупка
-app.post('/api/shop/buy', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
-  try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const { itemId } = req.body;
-    const item = shopItems.find(i => i.id === itemId);
-    if (!item) return res.status(404).json({ error: 'Товар не найден' });
-    const user = db.prepare('SELECT stars FROM users WHERE id = ?').get(decoded.id);
-    if (user.stars < item.price) return res.status(400).json({ error: 'Недостаточно звёзд' });
-    db.prepare('UPDATE users SET stars = stars - ? WHERE id = ?').run(item.price, decoded.id);
-    db.prepare('INSERT INTO purchases (user_id, item_id, item_name, price) VALUES (?, ?, ?, ?)').run(decoded.id, item.id, item.name, item.price);
-    const updatedUser = db.prepare('SELECT id, username, stars, role FROM users WHERE id = ?').get(decoded.id);
-    res.json({ success: true, message: `Вы купили "${item.name}"`, stars: updatedUser.stars });
-  } catch (e) {
-    res.status(401).json({ error: 'Ошибка при покупке' });
-  }
-});
-
-// История покупок пользователя (для профиля)
-app.get('/api/profile/purchases', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
-  try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const purchases = db.prepare('SELECT item_id, item_name, price, timestamp FROM purchases WHERE user_id = ? ORDER BY timestamp DESC').all(decoded.id);
-    res.json(purchases);
-  } catch (e) {
-    res.status(401).json({ error: 'Токен недействителен' });
-  }
-});
-
 // === Админ-маршруты ===
+
+// Получить всех пользователей (для админки)
 app.get('/api/admin/users', adminOnly, (req, res) => {
-  const users = db.prepare('SELECT id, username, stars, role FROM users ORDER BY username ASC').all();
+  const users = db.prepare('SELECT id, username, stars, role, verified FROM users ORDER BY username ASC').all();
   res.json(users);
 });
 
+// Выдать звёзды по username
 app.post('/api/admin/give-stars', adminOnly, (req, res) => {
   const { username, stars } = req.body;
   if (!username || stars === undefined) return res.status(400).json({ error: 'Укажите username и количество звёзд' });
@@ -201,6 +158,15 @@ app.post('/api/admin/give-stars', adminOnly, (req, res) => {
   res.json({ success: true, message: `${username} получил ${stars} звёзд` });
 });
 
+// Установить звёзды конкретному пользователю (по ID)
+app.post('/api/admin/set-stars', adminOnly, (req, res) => {
+  const { userId, stars } = req.body;
+  if (!userId || stars === undefined) return res.status(400).json({ error: 'Укажите userId и количество звёзд' });
+  db.prepare('UPDATE users SET stars = ? WHERE id = ?').run(stars, userId);
+  res.json({ success: true });
+});
+
+// Назначить администратора по username
 app.post('/api/admin/make-admin', adminOnly, (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ error: 'Укажите username' });
@@ -210,6 +176,18 @@ app.post('/api/admin/make-admin', adminOnly, (req, res) => {
   res.json({ success: true, message: `${username} теперь администратор` });
 });
 
+// Переключить верификацию (галочку) по username
+app.post('/api/admin/toggle-verify', adminOnly, (req, res) => {
+  const { username } = req.body;
+  if (!username) return res.status(400).json({ error: 'Укажите username' });
+  const user = db.prepare('SELECT id, verified FROM users WHERE username = ?').get(username);
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  const newVerified = user.verified ? 0 : 1;
+  db.prepare('UPDATE users SET verified = ? WHERE username = ?').run(newVerified, username);
+  res.json({ success: true, verified: newVerified, message: `${username} ${newVerified ? 'получил' : 'лишился'} галочки` });
+});
+
+// Удалить пользователя
 app.post('/api/admin/delete-user', adminOnly, (req, res) => {
   const { userId } = req.body;
   db.prepare('DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?').run(userId, userId);
