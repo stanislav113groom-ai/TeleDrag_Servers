@@ -1,223 +1,244 @@
-import express from 'express';
-import http from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import jwt from 'jsonwebtoken';
-import db from './db.js';
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const { Pool } = require('pg');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] }
-});
-
-const JWT_SECRET = 'teledrag-super-secret-key';
+const io = new Server(server, { cors: { origin: '*' } });
+const PORT = process.env.PORT || 3000;
+const SECRET = 'teledrag_secret_key_2024';
 
 app.use(cors());
-app.use(express.json({ limit: '5mb' })); // для приёма аватаров
-app.use(express.static('.')); // раздаём index.html
+app.use(express.json({ limit: '10mb' }));
 
-// Middleware для проверки администратора
-function adminOnly(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
+// Подключение к базе Neon (строка подключения из переменной окружения)
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // обязательно для Neon
+});
+
+// Создание таблиц при запуске
+(async () => {
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const user = db.prepare('SELECT role FROM users WHERE id = ?').get(decoded.id);
-    if (user && user.role === 'admin') {
-      req.user = decoded;
-      next();
-    } else {
-      res.status(403).json({ error: 'Доступ запрещён' });
-    }
-  } catch (e) {
-    res.status(401).json({ error: 'Токен недействителен' });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        stars INTEGER DEFAULT 0,
+        verified BOOLEAN DEFAULT FALSE,
+        role TEXT DEFAULT 'user',
+        avatar TEXT
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        sender_id INTEGER NOT NULL,
+        receiver_id INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        timestamp TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    console.log('Таблицы созданы/проверены');
+  } catch (err) {
+    console.error('Ошибка инициализации БД:', err);
   }
+})();
+
+// Аутентификация
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Токен не предоставлен' });
+  jwt.verify(token, SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Неверный токен' });
+    req.user = user;
+    next();
+  });
 }
 
-// Регистрация – Drag получает роль admin и верификацию
-app.post('/api/register', (req, res) => {
+// Регистрация
+app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ error: 'Заполните все поля' });
-
+  if (!username || !password || password.length < 4) {
+    return res.status(400).json({ error: 'Логин и пароль (мин. 4 символа) обязательны' });
+  }
   try {
-    const role = (username === 'Drag') ? 'admin' : 'user';
-    const verified = (username === 'Drag') ? 1 : 0;
-
-    const stmt = db.prepare('INSERT INTO users (username, password, role, verified) VALUES (?, ?, ?, ?)');
-    const result = stmt.run(username, password, role, verified);
-    const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users WHERE id = ?').get(result.lastInsertRowid);
+    const hash = await bcrypt.hash(password, 10);
+    const result = await pool.query(
+      'INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id, username, stars, verified, role',
+      [username.trim(), hash]
+    );
+    const user = result.rows[0];
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET);
     res.json({ token, user });
-  } catch (e) {
-    res.status(400).json({ error: 'Пользователь уже существует' });
+  } catch (err) {
+    if (err.code === '23505') return res.status(400).json({ error: 'Имя уже занято' });
+    res.status(500).json({ error: 'Ошибка базы данных' });
   }
 });
 
 // Вход
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  const user = db.prepare('SELECT * FROM users WHERE username = ? AND password = ?').get(username, password);
-  if (!user) return res.status(401).json({ error: 'Неверные данные' });
-
-  const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET);
-  res.json({ token, user: { id: user.id, username: user.username, stars: user.stars, role: user.role, verified: user.verified, avatar: user.avatar || '', created_at: user.created_at } });
-});
-
-// Получить свои данные
-app.get('/api/me', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const user = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users WHERE id = ?').get(decoded.id);
-    if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-    res.json(user);
-  } catch (e) {
-    res.status(401).json({ error: 'Токен недействителен' });
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username.trim()]);
+    if (result.rows.length === 0) return res.status(400).json({ error: 'Неверный логин или пароль' });
+    const user = result.rows[0];
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(400).json({ error: 'Неверный логин или пароль' });
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, SECRET);
+    res.json({
+      token,
+      user: { id: user.id, username: user.username, stars: user.stars, verified: user.verified, role: user.role, avatar: user.avatar }
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сервера' });
   }
 });
 
-// Список пользователей (с поиском, avatar и verified)
-app.get('/api/users', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
+// Профиль
+app.get('/api/me', authenticateToken, async (req, res) => {
+  const result = await pool.query('SELECT id, username, stars, verified, role, avatar FROM users WHERE id = $1', [req.user.id]);
+  if (result.rows.length === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+  res.json(result.rows[0]);
+});
+
+// Список пользователей
+app.get('/api/users', authenticateToken, async (req, res) => {
+  const search = req.query.search || '';
+  const result = await pool.query(
+    'SELECT id, username, stars, verified, role FROM users WHERE username ILIKE $1',
+    [`%${search}%`]
+  );
+  res.json(result.rows);
+});
+
+// Аватарка
+app.post('/api/upload-avatar', authenticateToken, async (req, res) => {
+  const { avatar } = req.body;
+  if (!avatar) return res.status(400).json({ error: 'Нет данных' });
+  await pool.query('UPDATE users SET avatar = $1 WHERE id = $2', [avatar, req.user.id]);
+  res.json({ message: 'Аватар обновлён' });
+});
+
+// Сообщения
+app.get('/api/messages/:userId', authenticateToken, async (req, res) => {
+  const { userId } = req.params;
+  const result = await pool.query(
+    `SELECT * FROM messages 
+     WHERE (sender_id = $1 AND receiver_id = $2) OR (sender_id = $2 AND receiver_id = $1) 
+     ORDER BY timestamp ASC`,
+    [req.user.id, userId]
+  );
+  res.json(result.rows);
+});
+
+// ===== Магазин =====
+app.post('/api/shop/buy-verification', authenticateToken, async (req, res) => {
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const search = req.query.search || '';
-    const users = db.prepare(`
-      SELECT id, username, stars, verified, avatar FROM users
-      WHERE id != ? AND username LIKE ?
-      ORDER BY username ASC
-    `).all(decoded.id, `%${search}%`);
-    res.json(users);
-  } catch (e) {
-    res.status(401).json({ error: 'Токен недействителен' });
+    const user = await pool.query('SELECT stars, verified FROM users WHERE id = $1', [req.user.id]);
+    if (user.rows.length === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+    const { stars, verified } = user.rows[0];
+    if (stars < 100) return res.status(400).json({ error: 'Недостаточно звёзд' });
+    if (verified) return res.status(400).json({ error: 'Уже верифицирован' });
+    await pool.query('UPDATE users SET stars = stars - 100, verified = TRUE WHERE id = $1', [req.user.id]);
+    res.json({ message: 'Верификация куплена!', stars: stars - 100, verified: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// История сообщений
-app.get('/api/messages/:userId', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
+app.post('/api/shop/buy-username-change', authenticateToken, async (req, res) => {
+  const { newUsername } = req.body;
+  if (!newUsername || newUsername.trim().length < 3) return res.status(400).json({ error: 'Ник не менее 3 символов' });
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const messages = db.prepare(`
-      SELECT * FROM messages
-      WHERE (sender_id = ? AND receiver_id = ?)
-         OR (sender_id = ? AND receiver_id = ?)
-      ORDER BY timestamp ASC
-    `).all(decoded.id, req.params.userId, req.params.userId, decoded.id);
-    res.json(messages);
-  } catch (e) {
-    res.status(401).json({ error: 'Токен недействителен' });
+    // Проверка занятости
+    const existing = await pool.query('SELECT id FROM users WHERE username = $1', [newUsername.trim()]);
+    if (existing.rows.length > 0) return res.status(400).json({ error: 'Ник уже занят' });
+    const user = await pool.query('SELECT stars FROM users WHERE id = $1', [req.user.id]);
+    if (user.rows[0].stars < 50) return res.status(400).json({ error: 'Недостаточно звёзд' });
+    await pool.query('UPDATE users SET stars = stars - 50, username = $1 WHERE id = $2', [newUsername.trim(), req.user.id]);
+    res.json({ message: 'Ник изменён!', stars: user.rows[0].stars - 50, username: newUsername.trim() });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка' });
   }
 });
 
-// Загрузка аватара (только для себя)
-app.post('/api/upload-avatar', (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ error: 'Нет токена' });
-  try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    const { avatar } = req.body; // base64
-    if (!avatar) return res.status(400).json({ error: 'Нет изображения' });
-    db.prepare('UPDATE users SET avatar = ? WHERE id = ?').run(avatar, decoded.id);
-    res.json({ success: true });
-  } catch (e) {
-    res.status(401).json({ error: 'Ошибка' });
-  }
+// ===== Админка =====
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Нет прав' });
+  next();
+}
+
+app.get('/api/admin/users', authenticateToken, requireAdmin, async (req, res) => {
+  const result = await pool.query('SELECT id, username, stars, verified, role FROM users');
+  res.json(result.rows);
 });
 
-// Получить аватар пользователя
-app.get('/api/avatar/:userId', (req, res) => {
-  const user = db.prepare('SELECT avatar FROM users WHERE id = ?').get(req.params.userId);
-  if (user && user.avatar) {
-    res.json({ avatar: user.avatar });
-  } else {
-    res.json({ avatar: null });
-  }
-});
-
-// ===== Админ-маршруты =====
-app.get('/api/admin/users', adminOnly, (req, res) => {
-  const users = db.prepare('SELECT id, username, stars, role, verified, avatar, created_at FROM users ORDER BY username ASC').all();
-  res.json(users);
-});
-
-app.post('/api/admin/give-stars', adminOnly, (req, res) => {
+app.post('/api/admin/give-stars', authenticateToken, requireAdmin, async (req, res) => {
   const { username, stars } = req.body;
-  if (!username || stars === undefined) return res.status(400).json({ error: 'Укажите username и количество звёзд' });
-  const user = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  db.prepare('UPDATE users SET stars = stars + ? WHERE username = ?').run(stars, username);
-  res.json({ success: true, message: `${username} получил ${stars} звёзд` });
+  await pool.query('UPDATE users SET stars = stars + $1 WHERE username = $2', [stars, username]);
+  res.json({ message: `Выдано ${stars} звёзд пользователю ${username}` });
 });
 
-app.post('/api/admin/set-stars', adminOnly, (req, res) => {
+app.post('/api/admin/make-admin', authenticateToken, requireAdmin, async (req, res) => {
+  const { username } = req.body;
+  await pool.query('UPDATE users SET role = $1 WHERE username = $2', ['admin', username]);
+  res.json({ message: `${username} теперь администратор` });
+});
+
+app.post('/api/admin/set-stars', authenticateToken, requireAdmin, async (req, res) => {
   const { userId, stars } = req.body;
-  if (!userId || stars === undefined) return res.status(400).json({ error: 'Укажите userId и количество звёзд' });
-  db.prepare('UPDATE users SET stars = ? WHERE id = ?').run(stars, userId);
-  res.json({ success: true });
+  await pool.query('UPDATE users SET stars = $1 WHERE id = $2', [stars, userId]);
+  res.json({ message: 'Звёзды обновлены' });
 });
 
-app.post('/api/admin/make-admin', adminOnly, (req, res) => {
+app.post('/api/admin/toggle-verify', authenticateToken, requireAdmin, async (req, res) => {
   const { username } = req.body;
-  if (!username) return res.status(400).json({ error: 'Укажите username' });
-  const user = db.prepare('SELECT id FROM users WHERE username = ?').get(username);
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  db.prepare("UPDATE users SET role = 'admin' WHERE username = ?").run(username);
-  res.json({ success: true, message: `${username} теперь администратор` });
+  const user = await pool.query('SELECT verified FROM users WHERE username = $1', [username]);
+  if (user.rows.length === 0) return res.status(400).json({ error: 'Пользователь не найден' });
+  const newVerified = !user.rows[0].verified;
+  await pool.query('UPDATE users SET verified = $1 WHERE username = $2', [newVerified, username]);
+  res.json({ message: `Верификация ${newVerified ? 'включена' : 'отключена'}`, verified: newVerified });
 });
 
-app.post('/api/admin/toggle-verify', adminOnly, (req, res) => {
-  const { username } = req.body;
-  if (!username) return res.status(400).json({ error: 'Укажите username' });
-  const user = db.prepare('SELECT id, verified FROM users WHERE username = ?').get(username);
-  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
-  const newVerified = user.verified ? 0 : 1;
-  db.prepare('UPDATE users SET verified = ? WHERE username = ?').run(newVerified, username);
-  res.json({ success: true, verified: newVerified, message: `${username} ${newVerified ? 'получил' : 'лишился'} галочки` });
-});
-
-app.post('/api/admin/delete-user', adminOnly, (req, res) => {
+app.post('/api/admin/delete-user', authenticateToken, requireAdmin, async (req, res) => {
   const { userId } = req.body;
-  db.prepare('DELETE FROM messages WHERE sender_id = ? OR receiver_id = ?').run(userId, userId);
-  db.prepare('DELETE FROM purchases WHERE user_id = ?').run(userId);
-  db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-  res.json({ success: true });
+  await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+  res.json({ message: 'Пользователь удалён' });
 });
 
-// ===== WebSocket =====
+// Socket.io (чат)
 io.on('connection', (socket) => {
-  let currentUserId = null;
   socket.on('authenticate', (token) => {
     try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      currentUserId = decoded.id;
-      socket.join(`user_${decoded.id}`);
+      const user = jwt.verify(token, SECRET);
+      socket.userId = user.id;
+      socket.username = user.username;
+      socket.join(`user_${user.id}`);
     } catch (e) {
-      socket.emit('auth_error', 'Неверный токен');
+      socket.disconnect();
     }
   });
-  socket.on('private_message', ({ to, text }) => {
-    if (!currentUserId) return;
-    const stmt = db.prepare('INSERT INTO messages (sender_id, receiver_id, text) VALUES (?, ?, ?)');
-    const result = stmt.run(currentUserId, to, text);
-    const message = {
-      id: result.lastInsertRowid,
-      sender_id: currentUserId,
-      receiver_id: to,
-      text,
-      timestamp: new Date().toISOString()
-    };
-    io.to(`user_${to}`).emit('private_message', message);
-    socket.emit('private_message', message);
+
+  socket.on('private_message', async (data) => {
+    if (!socket.userId) return;
+    const { to, text } = data;
+    const senderId = socket.userId;
+    // Сохраняем в БД
+    const result = await pool.query(
+      'INSERT INTO messages (sender_id, receiver_id, text) VALUES ($1, $2, $3) RETURNING id, timestamp',
+      [senderId, to, text]
+    );
+    const msg = { id: result.rows[0].id, sender_id: senderId, receiver_id: to, text, timestamp: result.rows[0].timestamp };
+    // Рассылаем
+    io.to(`user_${to}`).emit('private_message', msg);
+    io.to(`user_${senderId}`).emit('private_message', msg);
   });
-  socket.on('disconnect', () => {});
 });
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`TeleDrag сервер запущен на порту ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Сервер запущен на порту ${PORT}`));
